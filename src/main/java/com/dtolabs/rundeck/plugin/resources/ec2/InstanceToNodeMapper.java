@@ -36,6 +36,15 @@ import com.dtolabs.rundeck.core.common.NodeSetImpl;
 import org.apache.commons.beanutils.BeanUtils;
 import org.apache.log4j.Logger;
 
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.SdkHttpClient;
+import software.amazon.awssdk.services.ec2.*;
+import software.amazon.awssdk.services.ec2.model.*;
+import software.amazon.awssdk.services.ec2.paginators.DescribeInstancesIterable;
+
+import java.net.URI;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
@@ -53,8 +62,8 @@ import java.util.regex.Pattern;
  */
 class InstanceToNodeMapper {
     static final Logger logger = Logger.getLogger(InstanceToNodeMapper.class);
-    final AWSCredentials credentials;
-    private ClientConfiguration clientConfiguration;
+    final AwsCredentials credentials;
+    private SdkHttpClient clientConfiguration;
     private ExecutorService executorService = Executors.newSingleThreadExecutor();
     private ArrayList<String> filterParams;
     private String endpoint;
@@ -64,7 +73,7 @@ class InstanceToNodeMapper {
     /**
      * Create with the credentials and mapping definition
      */
-    InstanceToNodeMapper(final AWSCredentials credentials, final Properties mapping, final ClientConfiguration clientConfiguration) {
+    InstanceToNodeMapper(final AwsCredentials credentials, final Properties mapping, final SdkHttpClient clientConfiguration) {
         this.credentials = credentials;
         this.mapping = mapping;
         this.clientConfiguration = clientConfiguration;
@@ -77,17 +86,25 @@ class InstanceToNodeMapper {
     public INodeSet performQuery() {
         final NodeSetImpl nodeSet = new NodeSetImpl();
         
-        final AmazonEC2Client ec2 ;
+        Ec2ClientBuilder ec2Builder = Ec2Client.builder();
         if(null!=credentials) {
-            ec2 = new AmazonEC2Client(credentials, clientConfiguration);
+            ec2Builder
+                .credentialsProvider(StaticCredentialsProvider.create(credentials))
+                .httpClient(clientConfiguration)
+                .build();
         } else{
-            ec2 = new AmazonEC2Client(clientConfiguration);
+            ec2Builder
+                .httpClient(clientConfiguration)
+                .build();
         }
         if (null != getEndpoint()) {
-            ec2.setEndpoint(getEndpoint());
+           ec2Builder.endpointOverride(URI.create(getEndpoint()));
         }
+
+        Ec2Client ec2 = ec2Builder.build();
+
         final ArrayList<Filter> filters = buildFilters();
-        final Set<Instance> instances = query(ec2, new DescribeInstancesRequest().withFilters(filters));
+        final Set<Instance> instances = query(ec2, DescribeInstancesRequest.builder().filters(filters));
 
 
         mapInstances(nodeSet, instances);
@@ -111,10 +128,10 @@ class InstanceToNodeMapper {
         }
         final ArrayList<Filter> filters = buildFilters();
 
-        final Future<DescribeInstancesResult> describeInstancesRequest = ec2.describeInstancesAsync(
-            new DescribeInstancesRequest().withFilters(filters));
-
         return new Future<INodeSet>() {
+
+            Future<DescribeInstancesResult> describeInstancesRequest = ec2.describeInstancesAsync(
+                new DescribeInstancesRequest().withFilters(filters));
 
             public boolean cancel(boolean b) {
                 return describeInstancesRequest.cancel(b);
@@ -140,31 +157,44 @@ class InstanceToNodeMapper {
 
             public INodeSet get(final long l, final TimeUnit timeUnit) throws InterruptedException, ExecutionException,
                 TimeoutException {
-                DescribeInstancesResult describeInstancesResult = describeInstancesRequest.get(l, timeUnit);
+                final Set<Instance> instances = new HashSet<Instance>();
+
+                String nextToken = null;
+
+                while(true) {
+                    DescribeInstancesResult describeInstancesResult = describeInstancesRequest.get(l, timeUnit);
+                    nextToken = describeInstancesResult.getNextToken();
+
+                    if(nextToken != null) {
+                        describeInstancesRequest = ec2.describeInstancesAsync(
+                            new DescribeInstancesRequest().withFilters(filters).withNextToken(nextToken));
+                    } else {
+                        break;
+                    }
+                }
 
                 final NodeSetImpl nodeSet = new NodeSetImpl();
-                final Set<Instance> instances = examineResult(describeInstancesResult);
-
                 mapInstances(nodeSet, instances);
                 return nodeSet;
             }
         };
     }
 
-    private Set<Instance> query(final AmazonEC2Client ec2, final DescribeInstancesRequest request) {
-        //create "running" filter
+    private Set<Instance> query(final Ec2Client ec2, final DescribeInstancesRequest request) {
+        final DescribeInstancesIterable describeInstancesResult = ec2.describeInstancesPaginator(request);
+        Set<Instance> instances = new HashSet<Instance>();
 
-        final DescribeInstancesResult describeInstancesRequest = ec2.describeInstances(request);
+        describeInstancesResult.forEach(resp -> instances.addAll(examineResult(resp)));
 
-        return examineResult(describeInstancesRequest);
+        return instances;
     }
 
-    private Set<Instance> examineResult(DescribeInstancesResult describeInstancesRequest) {
-        final List<Reservation> reservations = describeInstancesRequest.getReservations();
+    private Set<Instance> examineResult(DescribeInstancesResponse describeInstancesRequest) {
+        final List<Reservation> reservations = describeInstancesRequest.reservations();
         final Set<Instance> instances = new HashSet<Instance>();
 
         for (final Reservation reservation : reservations) {
-            instances.addAll(reservation.getInstances());
+            instances.addAll(reservation.instances());
         }
         return instances;
     }
@@ -172,7 +202,10 @@ class InstanceToNodeMapper {
     private ArrayList<Filter> buildFilters() {
         final ArrayList<Filter> filters = new ArrayList<Filter>();
         if (isRunningStateOnly()) {
-            final Filter filter = new Filter("instance-state-name").withValues(InstanceStateName.Running.toString());
+            final Filter filter = Filter.builder()
+                .name("instance-state-name")
+                .values(InstanceStateName.RUNNING.toString())
+                .build();
             filters.add(filter);
         }
 
@@ -180,7 +213,7 @@ class InstanceToNodeMapper {
             for (final String filterParam : getFilterParams()) {
                 final String[] x = filterParam.split("=", 2);
                 if (!"".equals(x[0]) && !"".equals(x[1])) {
-                    filters.add(new Filter(x[0]).withValues(x[1].split(",")));
+                    filters.add(Filter.builder().name(x[0]).values(x[1].split(",")).build());
                 }
             }
         }
@@ -211,11 +244,11 @@ class InstanceToNodeMapper {
         //evaluate single settings.selector=tags/* mapping
         if ("tags/*".equals(mapping.getProperty("attributes.selector"))) {
             //iterate through instance tags and generate settings
-            for (final Tag tag : inst.getTags()) {
+            for (final Tag tag : inst.tags()) {
                 if (null == node.getAttributes()) {
                     node.setAttributes(new HashMap<String, String>());
                 }
-                node.getAttributes().put(tag.getKey(), tag.getValue());
+                node.getAttributes().put(tag.key(), tag.value());
             }
         }
         if (null != mapping.getProperty("tags.selector")) {
@@ -318,7 +351,7 @@ class InstanceToNodeMapper {
             name = node.getHostname();
         }
         if (null == name || "".equals(name)) {
-            name = inst.getInstanceId();
+            name = inst.instanceId();
         }
         node.setNodename(name);
 
@@ -418,10 +451,10 @@ class InstanceToNodeMapper {
         GeneratorException {
         if (null != selector && !"".equals(selector) && selector.startsWith("tags/")) {
             final String tag = selector.substring("tags/".length());
-            final List<Tag> tags = inst.getTags();
+            final List<Tag> tags = inst.tags();
             for (final Tag tag1 : tags) {
-                if (tag.equals(tag1.getKey())) {
-                    return tag1.getValue();
+                if (tag.equals(tag1.key())) {
+                    return tag1.value();
                 }
             }
         } else if (null != selector && !"".equals(selector)) {

@@ -23,19 +23,31 @@
 */
 package com.dtolabs.rundeck.plugin.resources.ec2;
 
-import com.amazonaws.auth.AWSCredentials;
-import com.amazonaws.ClientConfiguration;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.awscore.client.config.SdkClientConfiguration;
+import software.amazon.awssdk.core.SdkClient;
+
 import com.amazonaws.auth.BasicAWSCredentials;
 import com.amazonaws.auth.BasicSessionCredentials;
-import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClient;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.services.sts.*;
+import software.amazon.awssdk.services.sts.model.AssumeRoleRequest;
+import software.amazon.awssdk.services.sts.model.AssumeRoleResponse;
+import software.amazon.awssdk.services.sts.model.Credentials;
+import software.amazon.awssdk.http.SdkHttpClient;
+import software.amazon.awssdk.http.apache.*;
 import com.amazonaws.services.securitytoken.model.*;
 import com.dtolabs.rundeck.core.common.*;
 import com.dtolabs.rundeck.core.plugins.configuration.ConfigurationException;
 import com.dtolabs.rundeck.core.resources.ResourceModelSource;
 import com.dtolabs.rundeck.core.resources.ResourceModelSourceException;
+
+import org.apache.commons.httpclient.HttpClient;
 import org.apache.log4j.Logger;
 
 import java.io.*;
+import java.net.URI;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
@@ -74,8 +86,11 @@ public class EC2ResourceModelSource implements ResourceModelSource {
     final Properties mapping = new Properties();
     final String assumeRoleArn;
 
-    AWSCredentials credentials;
+    AwsCredentials credentials;
     ClientConfiguration clientConfiguration = new ClientConfiguration();;
+
+    SdkHttpClient httpClient;
+    ProxyConfiguration proxyConfiguration;
 
     INodeSet iNodeSet;
     static final Properties defaultMapping = new Properties();
@@ -176,18 +191,22 @@ public class EC2ResourceModelSource implements ResourceModelSource {
                 EC2ResourceModelSourceFactory.RUNNING_ONLY));
         }
         if (null != accessKey && null != secretKey) {
-            credentials = new BasicAWSCredentials(accessKey.trim(), secretKey.trim());
+            credentials = AwsBasicCredentials.create(accessKey.trim(), secretKey.trim());
             assumeRoleArn = null;
         }else{
             assumeRoleArn = configuration.getProperty(EC2ResourceModelSourceFactory.ROLE_ARN);
         }
 
         if (null != httpProxyHost && !"".equals(httpProxyHost)) {
-            clientConfiguration.setProxyHost(httpProxyHost);
-            clientConfiguration.setProxyPort(httpProxyPort);
-            clientConfiguration.setProxyUsername(httpProxyUser);
-            clientConfiguration.setProxyPassword(httpProxyPass);
+            proxyConfiguration = ProxyConfiguration.builder()
+                .username(httpProxyUser)
+                .password(httpProxyPass)
+                .endpoint(new URI(httpProxyHost + ":" + proxyPortStr))
+                .build();
         }
+
+        httpClient = ApacheHttpClient.builder().proxyConfiguration(proxyConfiguration).build();
+
         queryAsync = !("true".equals(configuration.getProperty(SYNCHRONOUS_LOAD)) || refreshInterval <= 0);
 
         initialize();
@@ -200,18 +219,30 @@ public class EC2ResourceModelSource implements ResourceModelSource {
         }
         loadMapping();
         if (this.credentials == null && assumeRoleArn != null) {
-            AWSSecurityTokenServiceClient sts_client = new AWSSecurityTokenServiceClient(clientConfiguration);
-            //        sts_client.setEndpoint("sts-endpoint.amazonaws.com");
-            AssumeRoleRequest assumeRoleRequest = new AssumeRoleRequest();
-            assumeRoleRequest.setRoleArn(assumeRoleArn);
-            assumeRoleRequest.setRoleSessionName("RundeckEC2ResourceModelSourceSession");
-            AssumeRoleResult assumeRoleResult = sts_client.assumeRole(assumeRoleRequest);
-            Credentials assumeCredentials = assumeRoleResult.getCredentials();
-            credentials = new BasicSessionCredentials(
-                    assumeCredentials.getAccessKeyId(),
-                    assumeCredentials.getSecretAccessKey(),
-                    assumeCredentials.getSessionToken()
-            );
+
+            StsClient sts_client = StsClient.builder().httpClient(httpClient).build();
+            AssumeRoleRequest assumeRoleRequest = AssumeRoleRequest.builder()
+                .roleArn(assumeRoleArn)
+                .roleSessionName("RundeckEC2ResourceModelSourceSession")
+                .build();
+
+            AssumeRoleResponse assumeRoleResult = sts_client.assumeRole(assumeRoleRequest);
+            Credentials assumeCredentials = assumeRoleResult.credentials();
+
+            credentials = AwsSessionCredentials.create(assumeCredentials.accessKeyId(), assumeCredentials.secretAccessKey(), assumeCredentials.sessionToken());
+            
+            // AWSSecurityTokenServiceClient sts_client = new AWSSecurityTokenServiceClient(clientConfiguration);
+            // //        sts_client.setEndpoint("sts-endpoint.amazonaws.com");
+            // AssumeRoleRequest assumeRoleRequest = new AssumeRoleRequest();
+            // assumeRoleRequest.setRoleArn(assumeRoleArn);
+            // assumeRoleRequest.setRoleSessionName("RundeckEC2ResourceModelSourceSession");
+            // AssumeRoleResult assumeRoleResult = sts_client.assumeRole(assumeRoleRequest);
+            // Credentials assumeCredentials = assumeRoleResult.getCredentials();
+            // credentials = new BasicSessionCredentials(
+            //         assumeCredentials.getAccessKeyId(),
+            //         assumeCredentials.getSecretAccessKey(),
+            //         assumeCredentials.getSessionToken()
+            // );
         }
 
 
