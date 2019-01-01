@@ -25,11 +25,9 @@ package com.dtolabs.rundeck.plugin.resources.ec2;
 
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
-import software.amazon.awssdk.awscore.client.config.SdkClientConfiguration;
-import software.amazon.awssdk.core.SdkClient;
 
-import com.amazonaws.auth.BasicAWSCredentials;
-import com.amazonaws.auth.BasicSessionCredentials;
+// import com.amazonaws.auth.BasicAWSCredentials;
+// import com.amazonaws.auth.BasicSessionCredentials;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.services.sts.*;
 import software.amazon.awssdk.services.sts.model.AssumeRoleRequest;
@@ -37,19 +35,20 @@ import software.amazon.awssdk.services.sts.model.AssumeRoleResponse;
 import software.amazon.awssdk.services.sts.model.Credentials;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.apache.*;
-import com.amazonaws.services.securitytoken.model.*;
+// import com.amazonaws.services.securitytoken.model.*;
 import com.dtolabs.rundeck.core.common.*;
 import com.dtolabs.rundeck.core.plugins.configuration.ConfigurationException;
 import com.dtolabs.rundeck.core.resources.ResourceModelSource;
 import com.dtolabs.rundeck.core.resources.ResourceModelSourceException;
 
-import org.apache.commons.httpclient.HttpClient;
 import org.apache.log4j.Logger;
 
 import java.io.*;
 import java.net.URI;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import static com.dtolabs.rundeck.plugin.resources.ec2.EC2ResourceModelSourceFactory.SYNCHRONOUS_LOAD;
@@ -87,10 +86,12 @@ public class EC2ResourceModelSource implements ResourceModelSource {
     final String assumeRoleArn;
 
     AwsCredentials credentials;
-    ClientConfiguration clientConfiguration = new ClientConfiguration();;
+    // ClientConfiguration clientConfiguration = new ClientConfiguration();
 
     SdkHttpClient httpClient;
     ProxyConfiguration proxyConfiguration;
+
+    ExecutorService executor = Executors.newFixedThreadPool(1);
 
     INodeSet iNodeSet;
     static final Properties defaultMapping = new Properties();
@@ -201,7 +202,7 @@ public class EC2ResourceModelSource implements ResourceModelSource {
             proxyConfiguration = ProxyConfiguration.builder()
                 .username(httpProxyUser)
                 .password(httpProxyPass)
-                .endpoint(new URI(httpProxyHost + ":" + proxyPortStr))
+                .endpoint(URI.create(httpProxyHost + ":" + proxyPortStr))
                 .build();
         }
 
@@ -246,7 +247,7 @@ public class EC2ResourceModelSource implements ResourceModelSource {
         }
 
 
-        mapper = new InstanceToNodeMapper(this.credentials, mapping, clientConfiguration);
+        mapper = new InstanceToNodeMapper(this.credentials, mapping, httpClient);
         mapper.setFilterParams(params);
         mapper.setEndpoint(endpoint);
         mapper.setRunningStateOnly(runningOnly);
@@ -262,11 +263,11 @@ public class EC2ResourceModelSource implements ResourceModelSource {
             return iNodeSet;
         }
         if (lastRefresh > 0 && queryAsync && null == futureResult) {
-            futureResult = mapper.performQueryAsync();
+            futureResult = executor.submit(mapper.performQuery());
             lastRefresh = System.currentTimeMillis();
         } else if (!queryAsync || lastRefresh < 1) {
             //always perform synchronous query the first time
-            iNodeSet = mapper.performQuery();
+            getFuture();
             lastRefresh = System.currentTimeMillis();
         }
         if (null != iNodeSet) {
@@ -280,15 +281,19 @@ public class EC2ResourceModelSource implements ResourceModelSource {
      */
     private void checkFuture() {
         if (null != futureResult && futureResult.isDone()) {
-            try {
-                iNodeSet = futureResult.get();
-            } catch (InterruptedException e) {
-                logger.debug(e);
-            } catch (ExecutionException e) {
-                logger.warn("Error performing query: " + e.getMessage(), e);
-            }
-            futureResult = null;
+            getFuture();
         }
+    }
+
+    private void getFuture() {
+        try {
+            iNodeSet = futureResult.get();
+        } catch (InterruptedException e) {
+            logger.debug(e);
+        } catch (ExecutionException e) {
+            logger.warn("Error performing query: " + e.getMessage(), e);
+        }
+        futureResult = null;
     }
 
     /**

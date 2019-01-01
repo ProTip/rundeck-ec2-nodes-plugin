@@ -23,12 +23,12 @@
 */
 package com.dtolabs.rundeck.plugin.resources.ec2;
 
-import com.amazonaws.auth.AWSCredentials;
-import com.amazonaws.ClientConfiguration;
-import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
-import com.amazonaws.services.ec2.AmazonEC2AsyncClient;
-import com.amazonaws.services.ec2.AmazonEC2Client;
-import com.amazonaws.services.ec2.model.*;
+// import com.amazonaws.auth.AWSCredentials;
+// import com.amazonaws.ClientConfiguration;
+// import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+// import com.amazonaws.services.ec2.AmazonEC2AsyncClient;
+// import com.amazonaws.services.ec2.AmazonEC2Client;
+// import com.amazonaws.services.ec2.model.*;
 import com.dtolabs.rundeck.core.common.INodeEntry;
 import com.dtolabs.rundeck.core.common.INodeSet;
 import com.dtolabs.rundeck.core.common.NodeEntryImpl;
@@ -48,6 +48,7 @@ import java.net.URI;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -83,7 +84,7 @@ class InstanceToNodeMapper {
      * Perform the query and return the set of instances
      *
      */
-    public INodeSet performQuery() {
+    public Callable<INodeSet> performQuery() {
         final NodeSetImpl nodeSet = new NodeSetImpl();
         
         Ec2ClientBuilder ec2Builder = Ec2Client.builder();
@@ -103,80 +104,11 @@ class InstanceToNodeMapper {
 
         Ec2Client ec2 = ec2Builder.build();
 
-        final ArrayList<Filter> filters = buildFilters();
-        final Set<Instance> instances = query(ec2, DescribeInstancesRequest.builder().filters(filters));
-
-
-        mapInstances(nodeSet, instances);
-        return nodeSet;
-    }
-
-    /**
-     * Perform the query asynchronously and return the set of instances
-     *
-     */
-    public Future<INodeSet> performQueryAsync() {
-        
-        final AmazonEC2AsyncClient ec2 ;
-        if(null!=credentials){
-            ec2= new AmazonEC2AsyncClient(credentials, clientConfiguration, executorService);
-        } else{
-            ec2 = new AmazonEC2AsyncClient(new DefaultAWSCredentialsProviderChain(), clientConfiguration, executorService);
-        }
-        if (null != getEndpoint()) {
-            ec2.setEndpoint(getEndpoint());
-        }
-        final ArrayList<Filter> filters = buildFilters();
-
-        return new Future<INodeSet>() {
-
-            Future<DescribeInstancesResult> describeInstancesRequest = ec2.describeInstancesAsync(
-                new DescribeInstancesRequest().withFilters(filters));
-
-            public boolean cancel(boolean b) {
-                return describeInstancesRequest.cancel(b);
-            }
-
-            public boolean isCancelled() {
-                return describeInstancesRequest.isCancelled();
-            }
-
-            public boolean isDone() {
-                return describeInstancesRequest.isDone();
-            }
-
-            public INodeSet get() throws InterruptedException, ExecutionException {
-                DescribeInstancesResult describeInstancesResult = describeInstancesRequest.get();
-
-                final NodeSetImpl nodeSet = new NodeSetImpl();
-                final Set<Instance> instances = examineResult(describeInstancesResult);
-
-                mapInstances(nodeSet, instances);
-                return nodeSet;
-            }
-
-            public INodeSet get(final long l, final TimeUnit timeUnit) throws InterruptedException, ExecutionException,
-                TimeoutException {
-                final Set<Instance> instances = new HashSet<Instance>();
-
-                String nextToken = null;
-
-                while(true) {
-                    DescribeInstancesResult describeInstancesResult = describeInstancesRequest.get(l, timeUnit);
-                    nextToken = describeInstancesResult.getNextToken();
-
-                    if(nextToken != null) {
-                        describeInstancesRequest = ec2.describeInstancesAsync(
-                            new DescribeInstancesRequest().withFilters(filters).withNextToken(nextToken));
-                    } else {
-                        break;
-                    }
-                }
-
-                final NodeSetImpl nodeSet = new NodeSetImpl();
-                mapInstances(nodeSet, instances);
-                return nodeSet;
-            }
+        return () -> {
+            final ArrayList<Filter> filters = buildFilters();
+            final Set<Instance> instances = query(ec2, DescribeInstancesRequest.builder().filters(filters).build());
+            mapInstances(nodeSet, instances);
+            return nodeSet;
         };
     }
 
